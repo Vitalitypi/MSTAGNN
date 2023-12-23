@@ -719,7 +719,7 @@ class Network(nn.Module):
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser(description='arguments')
-    args.add_argument('--dataset', default='PEMS08', type=str)
+    args.add_argument('--dataset', default='PEMS04', type=str)
     args.add_argument('--mode', default='train', type=str)
     args.add_argument('--device', default='cuda:0', type=str, help='indices of GPUs')
     args.add_argument('--debug', default='False', type=eval)
