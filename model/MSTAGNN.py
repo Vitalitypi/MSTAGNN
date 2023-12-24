@@ -109,71 +109,6 @@ class SelfAttentionLayer(nn.Module):
         out = out.transpose(dim, -2)
         return out
 
-class TrendFormer(nn.Module):
-    def __init__(
-            self,
-            num_nodes,              #节点数
-            batch_size,
-            input_dim,              #输入维度
-            output_dim=1,
-            periods=288,
-            weekend=7,
-            periods_embedding_dim=6,
-            weekend_embedding_dim=6,
-            embed_dim=12,              #GNN嵌入维度
-            in_steps=16,            #输入的时间长度
-            out_steps=12,
-            input_embedding_dim=8,
-            num_layers=3,
-            feed_forward_dim=256,
-            num_heads=4,
-            pre_train=False,
-                 ):
-        super(TrendFormer, self).__init__()
-        assert (input_embedding_dim + periods_embedding_dim + weekend_embedding_dim)%num_heads==0
-        self.in_steps = in_steps
-        self.out_steps = out_steps
-        self.num_nodes = num_nodes
-        self.output_dim = output_dim
-        self.pre_train = pre_train
-        self.dim_hidden = input_embedding_dim + periods_embedding_dim + weekend_embedding_dim
-        self.attn_t = nn.ModuleList(
-            [
-                SelfAttentionLayer(self.dim_hidden, feed_forward_dim, num_heads, 0.1)
-                for _ in range(num_layers)
-            ]
-        )
-        self.trend = nn.Linear(
-                in_steps * self.dim_hidden, out_steps * output_dim
-            )
-    def forward(self,x,encoding):
-        '''
-        :param x:
-            b,t,n,di
-        :return:
-            b,t,n,do
-        '''
-        residual = x
-        batch_size = x.shape[0]
-        for attn in self.attn_t:
-            encoding = attn(encoding, dim=1)
-        out = encoding.transpose(1, 2)  # (batch_size, num_nodes, in_steps, model_dim)
-        out = out.reshape(
-                batch_size, self.num_nodes, self.in_steps * self.dim_hidden
-            )
-        out = self.trend(out).view(
-                batch_size, self.num_nodes, self.out_steps, self.output_dim
-            )
-        out = out.transpose(1, 2)  # (batch_size, out_steps, num_nodes, output_dim)
-        if self.pre_train:
-            base_state = residual[:,-1,:,:1]
-            outputs = []
-            for i in range(self.out_steps):
-                outputs.append(base_state+out[:,i])
-            out = torch.stack(outputs,dim=1)
-            return out
-        return out
-
 class Encoder(nn.Module):
     def __init__(
             self,
@@ -300,20 +235,10 @@ class MGSTGNN(nn.Module):
         self.node_embeddings = nn.Parameter(torch.randn(num_nodes, embed_dim), requires_grad=True)
         self.time_embeddings = nn.Parameter(torch.randn(batch_size,in_steps, embed_dim), requires_grad=True)
 
-        # self.trendFormer = TrendFormer(num_nodes,batch_size,input_dim,output_dim,periods,
-                                       # weekend,periods_embedding_dim,weekend_embedding_dim,embed_dim,in_steps,out_steps,input_embedding_dim=input_embedding_dim)
         self.predictor = DSTRNN(num_nodes, num_input_dim, rnn_units, embed_dim, num_grus, in_steps, out_steps, dim_out=output_dim,
                         use_back=use_back,conv_steps=predict_time)
         self.predict_time = predict_time
-        # self.mlp = nn.Linear(
-        #         in_steps * 2, out_steps * output_dim
-        #     )
-    def load_pre_trained_model(self):
-        checkpoint = torch.load('../pre_trained/PEMS08/best_model.pth')
 
-        self.trendFormer.load_state_dict(checkpoint)
-        for param in self.trendFormer.parameters():
-            param.requires_grad = False
     def forward(self, source):
         batch_size = source.shape[0]
         encoding = self.encoder(source)
@@ -758,7 +683,6 @@ if __name__ == "__main__":
     args.add_argument('--weekend', default=config['model']['weekend'], type=int)
     args.add_argument('--predict_time', default=config['model']['predict_time'], type=int)
     args.add_argument('--use_back', default=config['model']['use_back'], type=eval)
-    args.add_argument('--pre_train', default=False, type=eval)
     #train
     args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
     args.add_argument('--random', default=config['train']['random'], type=eval)
@@ -786,10 +710,6 @@ if __name__ == "__main__":
     from utils.util import init_seed
     init_seed(args.seed)
     args.num_grus = [int(i) for i in list(args.num_grus.split(','))]
-    if args.pre_train:
-        model = TrendFormer(args.num_nodes,args.batch_size,args.input_dim,args.output_dim,args.periods,
-           args.weekend,args.periods_embedding_dim,args.weekend_embedding_dim,args.embed_dim,args.in_steps,args.out_steps,pre_train=args.pre_train)
-    else:
-        model = Network(args)
+    model = Network(args)
     # network = DDGCRN(307,1,64,1,2,10,12,12,1)
     summary(model, [args.batch_size, args.in_steps, args.num_nodes, args.input_dim])
