@@ -117,7 +117,7 @@ args = args.parse_args()
 args.num_grus = [int(i) for i in list(args.num_grus.split(','))]
 
 if args.random:
-    args.seed = torch.randint(1000, (1,))
+    args.seed = torch.randint(10000, (1,))
 print(args)
 init_seed(args.seed)
 if torch.cuda.is_available():
