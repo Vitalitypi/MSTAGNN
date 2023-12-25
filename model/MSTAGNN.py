@@ -269,8 +269,8 @@ class MSTARNN(nn.Module):
         seq_length = x.shape[1] # T
         current_inputs = x
         skip = current_inputs
+        state = init_state.to(x.device)
         for i in range(self.num_layers):
-            state = init_state[i].to(x.device)
             inner_states = [state]
             for t in range(0,seq_length,self.st_steps):
                 inp_h = torch.cat(inner_states, dim=1)
@@ -290,10 +290,7 @@ class MSTARNN(nn.Module):
         return None, predict
 
     def init_hidden(self, batch_size):
-        init_states = []
-        for i in range(self.num_layers):
-            init_states.append(self.grus[i].init_hidden_state(batch_size))
-        return init_states
+        return self.grus[0].init_hidden_state(batch_size)
 
 class MSTACell(nn.Module):
     def __init__(self,num_nodes,dim_in,dim_out,dim_embed,st_steps=3):
@@ -357,8 +354,8 @@ class TAGCM(nn.Module):
         # 首先通过1个GCN将x维度升至dim_hidden
         x = self.gcn(x,embeddings).permute(0,2,1,3)     # b,n,steps,do
         residual = x
-        state = self.attn(self.norm(x),states,states)
-        state = residual + self.dropout(state)          # b,n,steps,do
+        state = self.attn(x,states,states)
+        state = self.norm(residual + self.dropout(state))          # b,n,steps,do
         return state.permute(0,2,1,3)
 
 class DSTGCN(nn.Module):
