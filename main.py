@@ -79,16 +79,15 @@ args.add_argument('--num_input_dim', default=config['model']['num_input_dim'], t
 
 args.add_argument('--periods_embedding_dim', default=config['model']['periods_embedding_dim'], type=int)
 args.add_argument('--weekend_embedding_dim', default=config['model']['weekend_embedding_dim'], type=int)
-args.add_argument('--input_embedding_dim', default=config['model']['input_embedding_dim'], type=int)
 
 args.add_argument('--output_dim', default=config['model']['output_dim'], type=int)
 args.add_argument('--embed_dim', default=config['model']['embed_dim'], type=int)
 args.add_argument('--rnn_units', default=config['model']['rnn_units'], type=int)
-args.add_argument('--num_grus', default=config['model']['num_grus'], type=str)
+args.add_argument('--num_layers', default=config['model']['num_layers'], type=int)
 args.add_argument('--periods', default=config['model']['periods'], type=int)
 args.add_argument('--weekend', default=config['model']['weekend'], type=int)
-args.add_argument('--predict_time', default=config['model']['predict_time'], type=int)
-args.add_argument('--use_back', default=config['model']['use_back'], type=eval)
+args.add_argument('--last_steps', default=config['model']['last_steps'], type=int)
+args.add_argument('--st_steps', default=config['model']['st_steps'], type=int)
 
 #train
 args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
@@ -114,7 +113,6 @@ args.add_argument('--log_dir', default='./', type=str)
 args.add_argument('--log_step', default=config['log']['log_step'], type=int)
 args.add_argument('--plot', default=config['log']['plot'], type=eval)
 args = args.parse_args()
-args.num_grus = [int(i) for i in list(args.num_grus.split(','))]
 
 if args.random:
     args.seed = torch.randint(10000, (1,))

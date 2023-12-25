@@ -50,7 +50,7 @@ def get_dataloader_pems(dataset, batch_size=64, val_ratio=0.2, test_ratio=0.2, i
     # tods = get_tod(periods,time_stamps,num_nodes)
     time_features = get_tod_dow(dataset,time_stamps,num_nodes,periods)
     # concatenate all data
-    data = np.concatenate([data,time_features],axis=-1)
+    data = np.concatenate([data,time_features[...,:2]],axis=-1)
 
     # normalize data(only normalize the first dimension data)
     mean = data[..., 0].mean()

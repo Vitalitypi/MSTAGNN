@@ -121,7 +121,6 @@ class Encoder(nn.Module):
             weekend=7,
             embed_dim=12,
             in_steps=12,
-            input_embedding_dim=12,
     ):
         super(Encoder, self).__init__()
 
@@ -129,15 +128,12 @@ class Encoder(nn.Module):
         self.periods = periods
         self.weekend = weekend
         # 输入的embedding维度
-        self.input_embedding_dim = input_embedding_dim
         # 周期的embedding维度
         self.periods_embedding_dim = periods_embedding_dim
         # 每周的embedding维度
         self.weekend_embedding_dim = weekend_embedding_dim
         self.in_steps = in_steps
         self.input_dim = input_dim
-        if input_embedding_dim>0:
-            self.input_proj = nn.Linear(input_dim, input_embedding_dim)
         # period的embedding
         if periods_embedding_dim>0:
             self.periods_embedding = nn.Embedding(periods, periods_embedding_dim)
@@ -155,9 +151,6 @@ class Encoder(nn.Module):
 
         features = []
 
-        if self.input_embedding_dim>0:
-            features.append(self.input_proj(x))
-
         if self.periods_embedding_dim > 0:
             periods = x[..., 1]
             periods_emb = self.periods_embedding(
@@ -174,23 +167,6 @@ class Encoder(nn.Module):
             )  # (batch_size, in_steps, num_nodes, weekend_embedding_dim)
             features.append(weekend_emb)
             # time_embedding = torch.mul(time_embedding, weekend_emb[:,:,0])
-
-        if self.periods_embedding_dim > 0 and self.input_dim > 3:
-            periods = x[..., 3]
-            periods_emb = self.periods_embedding(
-                (periods*self.periods).long()
-            )
-            features.append(periods_emb)
-            # time_embedding = torch.mul(time_embedding, periods_emb[:,:,0])
-
-        if self.weekend_embedding_dim > 0 and self.input_dim > 4:
-            weekend = x[..., 4]
-            weekend_emb = self.weekend_embedding(
-                weekend.long()
-            )  # (batch_size, in_steps, num_nodes, weekend_embedding_dim)
-            features.append(weekend_emb)
-            # time_embedding = torch.mul(time_embedding, weekend_emb[:,:,0])
-
         encoding = torch.cat(features,dim=-1)          # 4 * dim_embed + dim_input_emb
         return encoding
 
@@ -202,17 +178,16 @@ class MSTAGNN(nn.Module):
             input_dim,              #输入维度
             rnn_units,              #GRU循环单元数
             output_dim,             #输出维度
-            num_grus,               #GRU的层数
+            num_layers,               #GRU的层数
             embed_dim,              #GNN嵌入维度
             in_steps=12,            #输入的时间长度
             out_steps=12,           #预测的时间长度
-            predict_time=1,
-            use_back=False,
+            last_steps=1,
+            st_steps=1,
             periods=288,
             weekend=7,
             periods_embedding_dim=6,
             weekend_embedding_dim=6,
-            input_embedding_dim=8,
             num_input_dim=1,
     ):
         super(MSTAGNN, self).__init__()
@@ -225,19 +200,17 @@ class MSTAGNN(nn.Module):
         self.in_steps = in_steps
         self.out_steps = out_steps
         self.embed_dim = embed_dim
-        self.num_grus = num_grus
-        self.input_embedding_dim = input_embedding_dim
+        self.num_layers = num_layers
         self.periods_embedding_dim = periods_embedding_dim
         self.weekend_embedding_dim = weekend_embedding_dim
-        # self.dim_hidden = input_embedding_dim + periods_embedding_dim * 2 + weekend_embedding_dim * 2
         self.encoder = Encoder(num_nodes, batch_size, periods_embedding_dim, weekend_embedding_dim, input_dim, periods,
-                               weekend, embed_dim, in_steps, input_embedding_dim)
+                               weekend, embed_dim, in_steps)
         self.node_embeddings = nn.Parameter(torch.randn(num_nodes, embed_dim), requires_grad=True)
         self.time_embeddings = nn.Parameter(torch.randn(batch_size,in_steps, embed_dim), requires_grad=True)
 
-        self.predictor = MSTARNN(num_nodes, num_input_dim, rnn_units, embed_dim, num_grus, in_steps, out_steps, dim_out=output_dim,
-                        use_back=use_back,conv_steps=predict_time)
-        self.predict_time = predict_time
+        self.predictor = MSTARNN(num_nodes, num_input_dim, rnn_units, embed_dim, num_layers, in_steps, out_steps, dim_out=output_dim,
+                        st_steps=st_steps,conv_steps=last_steps)
+        self.last_steps = last_steps
 
     def forward(self, source):
         batch_size = source.shape[0]
@@ -245,30 +218,28 @@ class MSTAGNN(nn.Module):
         node_embedding = self.node_embeddings
         time_embedding = self.time_embeddings[:batch_size]
         if self.periods_embedding_dim > 0:
-            emb_periods = encoding[...,self.input_embedding_dim:self.input_embedding_dim+self.periods_embedding_dim]
+            emb_periods = encoding[...,:self.embed_dim]
             time_embedding = torch.mul(time_embedding, emb_periods[:,:,0])
         if self.weekend_embedding_dim>0:
-            emb_weekend = encoding[...,self.input_embedding_dim+self.periods_embedding_dim:self.input_embedding_dim+self.periods_embedding_dim+self.weekend_embedding_dim]
+            emb_weekend = encoding[...,self.embed_dim:]
             time_embedding = torch.mul(time_embedding, emb_weekend[:,:,0])
         init_state = self.predictor.init_hidden(batch_size)#,self.num_node,self.hidden_dim
         _, output = self.predictor(source[...,:self.num_input_dim], init_state, [node_embedding, time_embedding]) # B, T, N, hidden
         return output
 
 class MSTARNN(nn.Module):
-    def __init__(self, num_nodes, dim_in, dim_hidden, dim_embed, num_grus, in_steps=12, out_steps=12, dim_out=1,
-            use_back=False, conv_steps=2, conv_bias=True, steps=1):
+    def __init__(self, num_nodes, dim_in, dim_hidden, dim_embed, num_layers, in_steps=12, out_steps=12, dim_out=1,
+            st_steps=1, conv_steps=2, conv_bias=True):
         super(MSTARNN, self).__init__()
-        assert len(num_grus) >= 1, 'At least one GRU layer in the RNN.'
+        assert num_layers >= 1, 'At least one GRU layer in the RNN.'
         self.num_nodes = num_nodes
         self.input_dim = dim_in
         self.dim_hidden = dim_hidden
-        self.use_back = use_back
-        self.num_grus = num_grus
-        self.num_layers = len(num_grus)
+        self.st_steps = st_steps
+        self.num_layers = num_layers
         self.out_steps = out_steps
-        self.steps = steps
         self.grus = nn.ModuleList([
-            MSTACell(num_nodes, dim_in, dim_hidden, dim_embed, steps)
+            MSTACell(num_nodes, dim_in, dim_hidden, dim_embed, st_steps)
             for _ in range(self.num_layers)
         ])
         # predict output
@@ -288,11 +259,9 @@ class MSTARNN(nn.Module):
             nn.Dropout(p=0.1)
             for _ in range(self.num_layers)
         ])
-        # self.output = nn.Linear(len(num_grus),1)
         self.conv_steps = conv_steps
     def forward(self, x, init_state, embeddings):
         # shape of x: (B, T, N, D)
-        # shape of init_state: (len(num_grus), B, N, hidden_dim)
         assert x.shape[2] == self.num_nodes and x.shape[3] == self.input_dim
 
         outputs = []
@@ -303,15 +272,15 @@ class MSTARNN(nn.Module):
         for i in range(self.num_layers):
             state = init_state[i].to(x.device)
             inner_states = [state]
-            for t in range(0,seq_length,self.steps):
+            for t in range(0,seq_length,self.st_steps):
                 inp_h = torch.cat(inner_states, dim=1)
-                inp_x = current_inputs[:, t:t+self.steps, :, :]
-                state = self.grus[i](inp_x, inp_h, [embeddings[0], embeddings[1][:, t:t+self.steps, :]])
+                inp_x = current_inputs[:, t:t+self.st_steps, :, :]
+                state = self.grus[i](inp_x, inp_h, [embeddings[0], embeddings[1][:, t:t+self.st_steps, :]])
                 inner_states.append(state)
             current_inputs = torch.cat(inner_states[1:], dim=1) # [B, T, N, D]
             current_inputs = self.dropouts[i](current_inputs[:, -self.conv_steps:, :, :])
             outputs.append(self.predictors[i](current_inputs).reshape(batch_size,self.out_steps,self.num_nodes,-1))
-            if i < len(self.num_grus)-1:
+            if i < self.num_layers-1:
                 current_inputs = skip - self.skips[i](current_inputs)
 
         # predict = torch.cat(outputs,dim=-1)
@@ -324,17 +293,17 @@ class MSTARNN(nn.Module):
         init_states = []
         for i in range(self.num_layers):
             init_states.append(self.grus[i].init_hidden_state(batch_size))
-        return init_states # [sum(num_grus), B, N, hidden_dim]
+        return init_states
 
 class MSTACell(nn.Module):
-    def __init__(self,num_nodes,dim_in,dim_out,dim_embed,steps=3):
+    def __init__(self,num_nodes,dim_in,dim_out,dim_embed,st_steps=3):
         super(MSTACell, self).__init__()
         self.dim_hidden = dim_out
         self.num_nodes = num_nodes
-        self.steps = steps
-        self.gate_z = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, steps)
-        self.gate_r = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, steps)
-        self.update = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, steps)
+        self.st_steps = st_steps
+        self.gate_z = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, st_steps)
+        self.gate_r = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, st_steps)
+        self.update = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, st_steps)
     def forward(self,x, states, embeddings):
         '''
         :param x:
@@ -346,7 +315,7 @@ class MSTACell(nn.Module):
         :return:
             b,steps,n,dh
         '''
-        state = states[:,-self.steps:]
+        state = states[:,-self.st_steps:]
         states = states.permute(0, 2, 1, 3)
         input_and_state = torch.cat((x, state), dim=-1) # [B, N, 1+D]
         z = torch.sigmoid(self.gate_z(input_and_state, states, embeddings))
@@ -357,14 +326,17 @@ class MSTACell(nn.Module):
         return h
 
     def init_hidden_state(self, batch_size):
-        return torch.zeros(batch_size, self.steps, self.num_nodes, self.dim_hidden)
+        return torch.zeros(batch_size, self.st_steps, self.num_nodes, self.dim_hidden)
 
 class TAGCM(nn.Module):
-    def __init__(self,dim_in,dim_out,dim_embed,num_nodes,steps=3,num_heads=4,mask=False,dropout=0.1):
+    def __init__(self,dim_in,dim_out,dim_embed,num_nodes,st_steps=3,num_heads=4,mask=False,dropout=0.1,kernel_size=0):
         super(TAGCM, self).__init__()
-        self.steps = steps
-
-        self.gcn = DSTGCN(dim_in, dim_out, dim_embed, num_nodes,steps)
+        self.st_steps = st_steps
+        self.kernel_size = kernel_size
+        if kernel_size > 0:
+            self.padding = (kernel_size - 1)//2
+            self.tcn = nn.Conv2d(dim_out, dim_out, (1, kernel_size), padding=(0, self.padding))
+        self.gcn = DSTGCN(dim_in, dim_out, dim_embed, num_nodes,st_steps)
         self.attn = AttentionLayer(dim_out, num_heads, mask)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(dim_out)
@@ -379,6 +351,9 @@ class TAGCM(nn.Module):
         :return:
             b,n,d
         '''
+        if self.kernel_size > 0:
+            states = states.permute(0,3,2,1)
+            states = self.tcn(states).permute(0,3,2,1)
         # 首先通过1个GCN将x维度升至dim_hidden
         x = self.gcn(x,embeddings).permute(0,2,1,3)     # b,n,steps,do
         residual = x
@@ -387,10 +362,10 @@ class TAGCM(nn.Module):
         return state.permute(0,2,1,3)
 
 class DSTGCN(nn.Module):
-    def __init__(self,dim_in,dim_out,dim_embed,num_nodes,steps=3):
+    def __init__(self,dim_in,dim_out,dim_embed,num_nodes,st_steps=3):
         super(DSTGCN, self).__init__()
         self.num_nodes = num_nodes
-        self.steps = steps
+        self.st_steps = st_steps
         self.dim_embed = dim_embed
         self.dim_out = dim_out
         self.weights_pool = nn.Parameter(torch.FloatTensor(dim_embed, 2, dim_in, dim_out)) # [D, C, F]
@@ -434,10 +409,10 @@ class DSTGCN(nn.Module):
 class Network(nn.Module):
     def __init__(self, args):
         super(Network, self).__init__()
-        self.mgstgnn = MSTAGNN(args.num_nodes,args.batch_size,args.input_dim,args.rnn_units,args.output_dim,args.num_grus,args.embed_dim,
-                in_steps=args.in_steps,out_steps=args.out_steps,predict_time=args.predict_time,use_back=args.use_back,
+        self.mgstgnn = MSTAGNN(args.num_nodes,args.batch_size,args.input_dim,args.rnn_units,args.output_dim,args.num_layers,args.embed_dim,
+                in_steps=args.in_steps,out_steps=args.out_steps,last_steps=args.last_steps,st_steps=args.st_steps,
                 periods=args.periods,weekend=args.weekend,periods_embedding_dim=args.periods_embedding_dim,
-                weekend_embedding_dim=args.weekend_embedding_dim,input_embedding_dim=args.input_embedding_dim,num_input_dim=args.num_input_dim)
+                weekend_embedding_dim=args.weekend_embedding_dim,num_input_dim=args.num_input_dim)
     def forward(self,x):
 
         out = self.mgstgnn(x)
@@ -474,16 +449,15 @@ if __name__ == "__main__":
 
     args.add_argument('--periods_embedding_dim', default=config['model']['periods_embedding_dim'], type=int)
     args.add_argument('--weekend_embedding_dim', default=config['model']['weekend_embedding_dim'], type=int)
-    args.add_argument('--input_embedding_dim', default=config['model']['input_embedding_dim'], type=int)
 
     args.add_argument('--output_dim', default=config['model']['output_dim'], type=int)
     args.add_argument('--embed_dim', default=config['model']['embed_dim'], type=int)
     args.add_argument('--rnn_units', default=config['model']['rnn_units'], type=int)
-    args.add_argument('--num_grus', default=config['model']['num_grus'], type=str)
+    args.add_argument('--num_layers', default=config['model']['num_layers'], type=int)
     args.add_argument('--periods', default=config['model']['periods'], type=int)
     args.add_argument('--weekend', default=config['model']['weekend'], type=int)
-    args.add_argument('--predict_time', default=config['model']['predict_time'], type=int)
-    args.add_argument('--use_back', default=config['model']['use_back'], type=eval)
+    args.add_argument('--last_steps', default=config['model']['last_steps'], type=int)
+    args.add_argument('--st_steps', default=config['model']['st_steps'], type=int)
     #train
     args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
     args.add_argument('--random', default=config['train']['random'], type=eval)
@@ -510,6 +484,5 @@ if __name__ == "__main__":
     args = args.parse_args()
     from utils.util import init_seed
     init_seed(args.seed)
-    args.num_grus = [int(i) for i in list(args.num_grus.split(','))]
     model = Network(args)
     summary(model, [args.batch_size, args.in_steps, args.num_nodes, args.input_dim])
