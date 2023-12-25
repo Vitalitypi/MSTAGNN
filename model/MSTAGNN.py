@@ -354,8 +354,8 @@ class TAGCM(nn.Module):
         # 首先通过1个GCN将x维度升至dim_hidden
         x = self.gcn(x,embeddings).permute(0,2,1,3)     # b,n,steps,do
         residual = x
-        state = self.attn(x,states,states)
-        state = self.norm(residual + self.dropout(state))          # b,n,steps,do
+        state = self.attn(self.norm(x),states,states)
+        state = residual + self.dropout(state)          # b,n,steps,do
         return state.permute(0,2,1,3)
 
 class DSTGCN(nn.Module):
