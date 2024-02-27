@@ -86,8 +86,8 @@ args.add_argument('--rnn_units', default=config['model']['rnn_units'], type=int)
 args.add_argument('--num_layers', default=config['model']['num_layers'], type=int)
 args.add_argument('--periods', default=config['model']['periods'], type=int)
 args.add_argument('--weekend', default=config['model']['weekend'], type=int)
-args.add_argument('--last_steps', default=config['model']['last_steps'], type=int)
-args.add_argument('--st_steps', default=config['model']['st_steps'], type=int)
+args.add_argument('--kernel', default=config['model']['kernel'], type=int)
+args.add_argument('--dim_feed_forward', default=config['model']['dim_feed_forward'], type=int)
 
 #train
 args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
