@@ -5,6 +5,10 @@ import torch
 from torch import nn
 from torchinfo import summary
 import torch.nn.functional as F
+import pywt
+import torch
+import numpy as np
+
 
 class AttentionLayer(nn.Module):
     """Perform attention across the -2 dim (the -1 dim is `model_dim`).
@@ -30,23 +34,10 @@ class AttentionLayer(nn.Module):
 
         self.head_dim = model_dim // num_heads
 
-        # self.FC_Q = nn.Linear(model_dim, model_dim)
-        # self.FC_K = nn.Linear(model_dim, model_dim)
-        # self.FC_V = nn.Linear(model_dim, model_dim)
-
-        # self.out_proj = nn.Linear(model_dim, model_dim)
-
     def forward(self, query, key, value):
-        # Q    (batch_size, ..., tgt_length, model_dim)
-        # K, V (batch_size, ..., src_length, model_dim)
         batch_size = query.shape[0]
         tgt_length = query.shape[-2]
         src_length = key.shape[-2]
-
-        # query = self.FC_Q(query)
-        # key = self.FC_K(key)
-        # value = self.FC_V(value)
-
         # Qhead, Khead, Vhead (num_heads * batch_size, ..., length, head_dim)
         query = torch.cat(torch.split(query, self.head_dim, dim=-1), dim=0)
         key = torch.cat(torch.split(key, self.head_dim, dim=-1), dim=0)
@@ -72,15 +63,18 @@ class AttentionLayer(nn.Module):
             torch.split(out, batch_size, dim=0), dim=-1
         )  # (batch_size, ..., tgt_length, head_dim * num_heads = model_dim)
 
-        # out = self.out_proj(out)
-
         return out
+
 
 class SelfAttentionLayer(nn.Module):
     def __init__(
-        self, model_dim, feed_forward_dim=2048, num_heads=8, dropout=0, mask=False
+        self, model_dim, feed_forward_dim=2048, num_heads=8, dropout=0, dim_out=1, mask=False
     ):
         super().__init__()
+
+        self.FC_Q = nn.Linear(model_dim, model_dim)
+        self.FC_K = nn.Linear(model_dim, model_dim)
+        self.FC_V = nn.Linear(model_dim, model_dim)
 
         self.attn = AttentionLayer(model_dim, num_heads, mask)
         self.feed_forward = nn.Sequential(
@@ -92,12 +86,15 @@ class SelfAttentionLayer(nn.Module):
         self.ln2 = nn.LayerNorm(model_dim)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
+        self.fc = nn.Linear(model_dim,dim_out)
 
-    def forward(self, x, dim=-2):
-        x = x.transpose(dim, -2)
+    def forward(self, q, k, v, dim=-2):
+        q = self.FC_Q(q).transpose(dim, -2)
+        k = self.FC_K(k).transpose(dim, -2)
+        v = self.FC_V(v).transpose(dim, -2)
         # x: (batch_size, ..., length, model_dim)
-        residual = x
-        out = self.attn(x, x, x)  # (batch_size, ..., length, model_dim)
+        residual = q
+        out = self.attn(q, k, v)  # (batch_size, ..., length, model_dim)
         out = self.dropout1(out)
         out = self.ln1(residual + out)
 
@@ -107,7 +104,8 @@ class SelfAttentionLayer(nn.Module):
         out = self.ln2(residual + out)
 
         out = out.transpose(dim, -2)
-        return out
+        return self.fc(out)
+
 
 class Encoder(nn.Module):
     def __init__(
@@ -159,7 +157,6 @@ class Encoder(nn.Module):
             features.append(periods_emb)
             # time_embedding = torch.mul(time_embedding, periods_emb[:,:,0])
 
-
         if self.weekend_embedding_dim > 0:
             weekend = x[..., 2]
             weekend_emb = self.weekend_embedding(
@@ -169,6 +166,7 @@ class Encoder(nn.Module):
             # time_embedding = torch.mul(time_embedding, weekend_emb[:,:,0])
         encoding = torch.cat(features,dim=-1)          # 4 * dim_embed + dim_input_emb
         return encoding
+
 
 class MSTAGNN(nn.Module):
     def __init__(
@@ -183,7 +181,6 @@ class MSTAGNN(nn.Module):
             in_steps=12,            #输入的时间长度
             out_steps=12,           #预测的时间长度
             last_steps=1,
-            st_steps=1,
             periods=288,
             weekend=7,
             periods_embedding_dim=6,
@@ -209,7 +206,7 @@ class MSTAGNN(nn.Module):
         self.time_embeddings = nn.Parameter(torch.randn(batch_size,in_steps, embed_dim), requires_grad=True)
 
         self.predictor = MSTARNN(num_nodes, num_input_dim, rnn_units, embed_dim, num_layers, in_steps, out_steps, dim_out=output_dim,
-                        st_steps=st_steps,conv_steps=last_steps)
+                       conv_steps=last_steps)
         self.last_steps = last_steps
 
     def forward(self, source):
@@ -224,35 +221,34 @@ class MSTAGNN(nn.Module):
             emb_weekend = encoding[...,self.embed_dim:]
             time_embedding = torch.mul(time_embedding, emb_weekend[:,:,0])
         init_state = self.predictor.init_hidden(batch_size)#,self.num_node,self.hidden_dim
-        _, output = self.predictor(source[...,:self.num_input_dim], init_state, [node_embedding, time_embedding]) # B, T, N, hidden
+        _, output = self.predictor(source[...,:self.num_input_dim], init_state, [node_embedding, time_embedding], source[...,self.num_input_dim:]) # B, T, N, hidden
         return output
+
 
 class MSTARNN(nn.Module):
     def __init__(self, num_nodes, dim_in, dim_hidden, dim_embed, num_layers, in_steps=12, out_steps=12, dim_out=1,
-            st_steps=1, conv_steps=2, conv_bias=True):
+            conv_steps=2):
         super(MSTARNN, self).__init__()
         assert num_layers >= 1, 'At least one GRU layer in the RNN.'
         self.num_nodes = num_nodes
         self.input_dim = dim_in
         self.dim_hidden = dim_hidden
-        self.st_steps = st_steps
         self.num_layers = num_layers
         self.out_steps = out_steps
+        self.kernel = conv_steps
         self.grus = nn.ModuleList([
-            MSTACell(num_nodes, dim_in, dim_hidden, dim_embed, st_steps)
+            MSTACell(num_nodes, dim_in, dim_hidden, dim_embed, self.kernel)
+            for _ in range(self.num_layers)
+        ])
+        self.attns = nn.ModuleList([
+            SelfAttentionLayer(3,16,1,0.1)
             for _ in range(self.num_layers)
         ])
         # predict output
         self.predictors = nn.ModuleList([
-             # nn.Linear(hidden_dim,dim_cat)
-             nn.Conv2d(conv_steps, dim_out * out_steps, kernel_size=(1,dim_hidden), bias=conv_bias)
-             for _ in range(self.num_layers)
-        ])
-        # skip
-        self.skips = nn.ModuleList([
-            # nn.Linear(dim_hidden+1,dim_in)
-            nn.Conv2d(conv_steps, dim_in * in_steps, kernel_size=(1,dim_hidden), bias=conv_bias)
-            for _ in range(self.num_layers-1)
+            # nn.Linear(conv_steps*dim_hidden,dim_out*out_steps)
+            nn.Conv2d(conv_steps, dim_out * out_steps, kernel_size=(1,dim_hidden))
+            for _ in range(self.num_layers)
         ])
         # dropout
         self.dropouts = nn.ModuleList([
@@ -260,7 +256,8 @@ class MSTARNN(nn.Module):
             for _ in range(self.num_layers)
         ])
         self.conv_steps = conv_steps
-    def forward(self, x, init_state, embeddings):
+
+    def forward(self, x, init_state, embeddings, periods):
         # shape of x: (B, T, N, D)
         assert x.shape[2] == self.num_nodes and x.shape[3] == self.input_dim
 
@@ -268,22 +265,29 @@ class MSTARNN(nn.Module):
         batch_size = x.shape[0]
         seq_length = x.shape[1] # T
         current_inputs = x
-        skip = current_inputs
-        state = init_state.to(x.device)
+        # emb = self.dropouts[0](embeddings[0].unsqueeze(0).unsqueeze(0) + embeddings[1].unsqueeze(-2))        # b,2,n,d
+        state = init_state.to(x.device)         # b,kernel,n,d
         for i in range(self.num_layers):
             inner_states = [state]
-            for t in range(0,seq_length,self.st_steps):
-                inp_h = torch.cat(inner_states, dim=1)
-                inp_x = current_inputs[:, t:t+self.st_steps, :, :]
-                state = self.grus[i](inp_x, inp_h, [embeddings[0], embeddings[1][:, t:t+self.st_steps, :]])
+            skip = current_inputs
+            wavelet = torch.cat([current_inputs, periods], dim=-1)
+            xl,xh = self.disentangle(wavelet.detach().cpu().numpy(),'coif1',1)
+            # q = torch.cat([current_inputs,])
+            kv = torch.cat([torch.Tensor(xl).to(skip.device),torch.Tensor(xh).to(skip.device)],dim=1)
+            attn = self.attns[i](wavelet,kv,kv,dim=1)
+            current_inputs -= attn
+            for t in range(0,seq_length,self.kernel):
+                inp_x = current_inputs[:,t:t+self.kernel]                        # b,kernel.n,d
+                inp_h = torch.cat(inner_states,dim=1)     # b,t+1,kernel,n,d
+                state = self.grus[i](inp_x, inp_h, [embeddings[0], embeddings[1][:, t:t+self.kernel]])         # b,n,di*kernel    b,t,n,dh    [(n,de),(b,de)]
                 inner_states.append(state)
             current_inputs = torch.cat(inner_states[1:], dim=1) # [B, T, N, D]
-            current_inputs = self.dropouts[i](current_inputs[:, -self.conv_steps:, :, :])
-            outputs.append(self.predictors[i](current_inputs).reshape(batch_size,self.out_steps,self.num_nodes,-1))
-            if i < self.num_layers-1:
-                current_inputs = skip - self.skips[i](current_inputs)
 
-        # predict = torch.cat(outputs,dim=-1)
+            current_inputs = self.dropouts[i](current_inputs[:, -self.conv_steps:, :, :])
+            outputs.append(self.predictors[i](current_inputs)+attn)
+            if i < self.num_layers-1:
+                current_inputs = skip - outputs[i]
+
         predict = outputs[0]
         for i in range(1,len(outputs)):
             predict = predict + outputs[i]
@@ -292,29 +296,43 @@ class MSTARNN(nn.Module):
     def init_hidden(self, batch_size):
         return self.grus[0].init_hidden_state(batch_size)
 
+    def disentangle(self,x, w, j):
+        x = x.transpose(0,3,2,1) # [S,D,N,T]
+        coef = pywt.wavedec(x, w, level=j)
+        coefl = coef[:1]
+        # for i in range(len(coef)-1):
+        #     coefl.append(None)
+        coefh = coef[1:]
+        # for i in range(len(coef)-1):
+        #     coefh.append(coef[i+1])
+        xl = pywt.waverec(coefl, w).transpose(0,3,2,1)
+        xh = pywt.waverec(coefh, w).transpose(0,3,2,1)
+
+        return xl, xh
+
 class MSTACell(nn.Module):
-    def __init__(self,num_nodes,dim_in,dim_out,dim_embed,st_steps=3):
+    def __init__(self,num_nodes,dim_in,dim_out,dim_embed,kernel=2):
         super(MSTACell, self).__init__()
         self.dim_hidden = dim_out
         self.num_nodes = num_nodes
-        self.st_steps = st_steps
-        self.gate_z = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, st_steps)
-        self.gate_r = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, st_steps)
-        self.update = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes, st_steps)
+        self.kernel = kernel
+        self.gate_z = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes,kernel)
+        self.gate_r = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes,kernel)
+        self.update = TAGCM(dim_in+self.dim_hidden, dim_out, dim_embed, num_nodes,kernel)
     def forward(self,x, states, embeddings):
         '''
         :param x:
             b,steps,n,di
         :param state:
-            b,steps,n,dh
+            b,t,n,dh
         :param embedding:
              [(n,d),(b,steps,d)]
         :return:
-            b,steps,n,dh
+            b,n,dh
         '''
-        state = states[:,-self.st_steps:]
+        state = states[:,-self.kernel:]
         states = states.permute(0, 2, 1, 3)
-        input_and_state = torch.cat((x, state), dim=-1) # [B, N, 1+D]
+        input_and_state = torch.cat((x, state), dim=-1) # [B, kernel, N, 1+D]
         z = torch.sigmoid(self.gate_z(input_and_state, states, embeddings))
         r = torch.sigmoid(self.gate_r(input_and_state, states, embeddings))
         candidate = torch.cat((x, z*state), dim=-1)
@@ -323,97 +341,87 @@ class MSTACell(nn.Module):
         return h
 
     def init_hidden_state(self, batch_size):
-        return torch.zeros(batch_size, self.st_steps, self.num_nodes, self.dim_hidden)
+        return torch.zeros(batch_size, self.kernel, self.num_nodes, self.dim_hidden)
+
 
 class TAGCM(nn.Module):
-    def __init__(self,dim_in,dim_out,dim_embed,num_nodes,st_steps=3,num_heads=4,mask=False,dropout=0.1,kernel_size=0):
+    def __init__(self, dim_in, dim_out, dim_embed, num_nodes, kernel, num_heads=4, mask=False, dropout=0.1):
         super(TAGCM, self).__init__()
-        self.st_steps = st_steps
-        self.kernel_size = kernel_size
-        if kernel_size > 0:
-            self.padding = (kernel_size - 1)//2
-            self.tcn = nn.Conv2d(dim_out, dim_out, (1, kernel_size), padding=(0, self.padding))
-        self.gcn = DSTGCN(dim_in, dim_out, dim_embed, num_nodes,st_steps)
+        self.gcn = DSTGCM(dim_in, dim_out, dim_embed, num_nodes, kernel)
         self.attn = AttentionLayer(dim_out, num_heads, mask)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(dim_out)
     def forward(self, x, states, embeddings):
         '''
         :param x:
-            b,steps,n,di
+            b,n,di
         :param states:
             b,n,t,do
         :param embeddings:
-            [(n,de),(b,steps,de)]
+            [(n,de),(b,de)]
         :return:
             b,n,d
         '''
-        if self.kernel_size > 0:
-            states = states.permute(0,3,2,1)
-            states = self.tcn(states).permute(0,3,2,1)
         # 首先通过1个GCN将x维度升至dim_hidden
-        x = self.gcn(x,embeddings).permute(0,2,1,3)     # b,n,steps,do
+        x = self.gcn(x, embeddings)     # b,kernel,n,do
         residual = x
-        state = self.attn(self.norm(x),states,states)
-        state = residual + self.dropout(state)          # b,n,steps,do
-        return state.permute(0,2,1,3)
+        state = self.attn(self.norm(x.transpose(1,2)),states,states).transpose(1,2)
+        state = residual + self.dropout(state)          # b,kernel,n,do
+        return state
 
-class DSTGCN(nn.Module):
-    def __init__(self,dim_in,dim_out,dim_embed,num_nodes,st_steps=3):
-        super(DSTGCN, self).__init__()
+class DSTGCM(nn.Module):
+    def __init__(self, dim_in, dim_out, dim_embed, num_nodes, kernel):
+        super(DSTGCM, self).__init__()
         self.num_nodes = num_nodes
-        self.st_steps = st_steps
         self.dim_embed = dim_embed
         self.dim_out = dim_out
+        self.dim_in = dim_in
+        self.kernel = kernel
         self.weights_pool = nn.Parameter(torch.FloatTensor(dim_embed, 2, dim_in, dim_out)) # [D, C, F]
         self.bias_pool = nn.Parameter(torch.FloatTensor(dim_embed, dim_out)) # [D, F]
+
         self.norm = nn.LayerNorm(dim_embed, eps=1e-12)
         self.drop = nn.Dropout(0.1)
 
-    def forward(self,x,embeddings):
+    def forward(self, x, embeddings):
         '''
         :param x:
-            b,3,n,di
+            b,2,n,di
         :param embeddings:
-            [(n,d),(b,3,d)]
+            [(n,d),(b,2,d)]
         :return:
-            b,3,n,do
+            b,2,n,do
         '''
-        b,t,n,d = x.size()
         node_embeddings, time_embeddings = embeddings[0],embeddings[1]
-        node_embeddings = torch.stack([node_embeddings for _ in range(t)],dim=0)            # 3,n,d
         supports1 = torch.eye(self.num_nodes).to(x.device)                                # n,n
-        supports1 = torch.stack([supports1 for _ in range(t)],dim=0)
         embedding = self.drop(
-            self.norm(node_embeddings.unsqueeze(0) + time_embeddings.unsqueeze(-2)))        # b,3,n,d
-        # embedding = embedding.view(b,t*n,self.dim_embed)
-        supports2 = F.softmax(torch.matmul(embedding, embedding.transpose(-2, -1)), dim=-1)   # b,3,n,n
+            self.norm(node_embeddings.unsqueeze(0).unsqueeze(0) + time_embeddings.unsqueeze(-2)))        # b,2,n,d
+        supports2 = F.softmax(torch.matmul(embedding, embedding.transpose(-2, -1)), dim=-1)   # b,2,n,n
 
-        # node_embeddings = node_embeddings.view(t*n,self.dim_embed)
-
-
-        x_g1 = torch.einsum("tnm,btmc->btnc", supports1, x)
+        x_g1 = torch.einsum("nm,btmc->btnc", supports1, x)
         x_g2 = torch.einsum("btnm,btmc->btnc", supports2, x)
-
         x_g = torch.stack([x_g1,x_g2],dim=1)        # b,2,t,n,d
-        weights = torch.einsum('tnd,dkio->tnkio', node_embeddings, self.weights_pool) # N, dim_in, dim_out
+        weights = torch.einsum('nd,dkio->nkio', node_embeddings, self.weights_pool) # N, dim_in, dim_out
         bias = torch.einsum('btd,do->bto', time_embeddings, self.bias_pool) # b, t, o
         x_g = x_g.permute(0, 2, 3, 1, 4)  # B, t, n, k, i
 
-        st_gconv = torch.einsum('btnki,tnkio->btno', x_g, weights) + bias.unsqueeze(-2)  # b, t, 1, o
+        st_gconv = torch.einsum('btnki,nkio->btno', x_g, weights) + bias.unsqueeze(-2) # b, k, n, o
         return st_gconv
+
 
 class Network(nn.Module):
     def __init__(self, args):
         super(Network, self).__init__()
         self.mgstgnn = MSTAGNN(args.num_nodes,args.batch_size,args.input_dim,args.rnn_units,args.output_dim,args.num_layers,args.embed_dim,
-                in_steps=args.in_steps,out_steps=args.out_steps,last_steps=args.last_steps,st_steps=args.st_steps,
+                in_steps=args.in_steps,out_steps=args.out_steps,last_steps=args.last_steps,
                 periods=args.periods,weekend=args.weekend,periods_embedding_dim=args.periods_embedding_dim,
                 weekend_embedding_dim=args.weekend_embedding_dim,num_input_dim=args.num_input_dim)
+
     def forward(self,x):
 
         out = self.mgstgnn(x)
         return out
+
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser(description='arguments')
