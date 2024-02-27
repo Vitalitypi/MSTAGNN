@@ -3,7 +3,7 @@
 # 主要的超参数有：dim_embedding_periods, dim_embeddings_week, embed_dim, rnn_units, num_layers, kernel, dim_feed_forward
 random=("1" "2" "3")
 # PEMS03, PEMS04, PEMS07, PEMS08
-datasets=('PEMS03')
+dataset=('PEMS03')
 
 dim_embed=("4" "6" "8" "10" "12")
 use_periods=('0' '1')
