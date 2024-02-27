@@ -165,8 +165,8 @@ class Encoder(nn.Module):
             )  # (batch_size, in_steps, num_nodes, weekend_embedding_dim)
             features.append(weekend_emb)
             # time_embedding = torch.mul(time_embedding, weekend_emb[:,:,0])
-        encoding = torch.cat(features, dim=-1)  # 4 * dim_embed + dim_input_emb
-        return encoding
+        # encoding = torch.cat(features, dim=-1)  # 4 * dim_embed + dim_input_emb
+        return features
 
 
 class MSTAGNN(nn.Module):
@@ -214,14 +214,16 @@ class MSTAGNN(nn.Module):
 
     def forward(self, source):
         batch_size = source.shape[0]
-        encoding = self.encoder(source)
+        features = self.encoder(source)
         node_embedding = self.node_embeddings
         time_embedding = self.time_embeddings[:batch_size]
+        index = 0
         if self.periods_embedding_dim > 0:
-            emb_periods = encoding[..., :self.embed_dim]
+            emb_periods = features[index]
             time_embedding = torch.mul(time_embedding, emb_periods[:, :, 0])
+            index+=1
         if self.weekend_embedding_dim > 0:
-            emb_weekend = encoding[..., self.embed_dim:]
+            emb_weekend = features[index]
             time_embedding = torch.mul(time_embedding, emb_weekend[:, :, 0])
         init_state = self.predictor.init_hidden(batch_size)  # ,self.num_node,self.hidden_dim
         _, output = self.predictor(source[..., :self.num_input_dim], init_state, [node_embedding, time_embedding],
