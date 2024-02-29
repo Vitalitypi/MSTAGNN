@@ -1,13 +1,9 @@
 import argparse
 import configparser
-
-import torch
 from torch import nn
 from torchinfo import summary
 import torch.nn.functional as F
-import pywt
 import torch
-import numpy as np
 
 
 class AttentionLayer(nn.Module):
@@ -64,47 +60,6 @@ class AttentionLayer(nn.Module):
         )  # (batch_size, ..., tgt_length, head_dim * num_heads = model_dim)
 
         return out
-
-
-class SelfAttentionLayer(nn.Module):
-    def __init__(
-            self, model_dim, feed_forward_dim=2048, num_heads=8, dropout=0, dim_out=1, mask=False
-    ):
-        super().__init__()
-
-        self.FC_Q = nn.Linear(model_dim, model_dim)
-        self.FC_K = nn.Linear(model_dim, model_dim)
-        self.FC_V = nn.Linear(model_dim, model_dim)
-
-        self.attn = AttentionLayer(model_dim, num_heads, mask)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(model_dim, feed_forward_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feed_forward_dim, model_dim),
-        )
-        self.ln1 = nn.LayerNorm(model_dim)
-        self.ln2 = nn.LayerNorm(model_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.fc = nn.Linear(model_dim, dim_out)
-
-    def forward(self, q, k, v, dim=-2):
-        q = self.FC_Q(q).transpose(dim, -2)
-        k = self.FC_K(k).transpose(dim, -2)
-        v = self.FC_V(v).transpose(dim, -2)
-        # x: (batch_size, ..., length, model_dim)
-        residual = q
-        out = self.attn(q, k, v)  # (batch_size, ..., length, model_dim)
-        out = self.dropout1(out)
-        out = self.ln1(residual + out)
-
-        residual = out
-        out = self.feed_forward(out)  # (batch_size, ..., length, model_dim)
-        out = self.dropout2(out)
-        out = self.ln2(residual + out)
-
-        out = out.transpose(dim, -2)
-        return self.fc(out)
 
 
 class Encoder(nn.Module):
@@ -165,7 +120,6 @@ class Encoder(nn.Module):
             )  # (batch_size, in_steps, num_nodes, weekend_embedding_dim)
             features.append(weekend_emb)
             # time_embedding = torch.mul(time_embedding, weekend_emb[:,:,0])
-        # encoding = torch.cat(features, dim=-1)  # 4 * dim_embed + dim_input_emb
         return features
 
 
@@ -187,7 +141,6 @@ class MSTAGNN(nn.Module):
             periods_embedding_dim=6,
             weekend_embedding_dim=6,
             num_input_dim=1,
-            dim_feed_forward=16
     ):
         super(MSTAGNN, self).__init__()
         assert num_input_dim <= input_dim
@@ -208,7 +161,7 @@ class MSTAGNN(nn.Module):
         self.time_embeddings = nn.Parameter(torch.randn(batch_size, in_steps, embed_dim), requires_grad=True)
 
         self.predictor = MSTARNN(num_nodes, num_input_dim, rnn_units, embed_dim, num_layers, in_steps, out_steps,
-                                 dim_out=output_dim, dim_feed_forward=dim_feed_forward,
+                                 dim_out=output_dim,
                                  kernel=kernel)
         self.kernel = kernel
 
@@ -221,19 +174,19 @@ class MSTAGNN(nn.Module):
         if self.periods_embedding_dim > 0:
             emb_periods = features[index]
             time_embedding = torch.mul(time_embedding, emb_periods[:, :, 0])
-            index+=1
+            index += 1
         if self.weekend_embedding_dim > 0:
             emb_weekend = features[index]
             time_embedding = torch.mul(time_embedding, emb_weekend[:, :, 0])
         init_state = self.predictor.init_hidden(batch_size)  # ,self.num_node,self.hidden_dim
-        _, output = self.predictor(source[..., :self.num_input_dim], init_state, [node_embedding, time_embedding],
-                                   source[..., self.num_input_dim:])  # B, T, N, hidden
+        _, output = self.predictor(source[..., :self.num_input_dim], init_state,
+                                   [node_embedding, time_embedding])  # B, T, N, hidden
         return output
 
 
 class MSTARNN(nn.Module):
     def __init__(self, num_nodes, dim_in, dim_hidden, dim_embed, num_layers, in_steps=12, out_steps=12, dim_out=1,
-                 kernel=2, dim_source=3, dim_feed_forward=16, num_heads=1, dropout=0.1):
+                 kernel=2):
         super(MSTARNN, self).__init__()
         assert num_layers >= 1, 'At least one GRU layer in the RNN.'
         self.num_nodes = num_nodes
@@ -244,10 +197,6 @@ class MSTARNN(nn.Module):
         self.kernel = kernel
         self.grus = nn.ModuleList([
             MSTACell(num_nodes, dim_in, dim_hidden, dim_embed, self.kernel)
-            for _ in range(self.num_layers)
-        ])
-        self.attns = nn.ModuleList([
-            SelfAttentionLayer(dim_source, dim_feed_forward, num_heads, dropout)
             for _ in range(self.num_layers)
         ])
         # predict output
@@ -262,7 +211,7 @@ class MSTARNN(nn.Module):
         ])
         self.kernel = kernel
 
-    def forward(self, x, init_state, embeddings, periods):
+    def forward(self, x, init_state, embeddings):
         # shape of x: (B, T, N, D)
         assert x.shape[2] == self.num_nodes and x.shape[3] == self.input_dim
 
@@ -273,11 +222,6 @@ class MSTARNN(nn.Module):
         for i in range(self.num_layers):
             inner_states = [state]
             skip = current_inputs
-            wavelet = torch.cat([current_inputs, periods], dim=-1)
-            xl, xh = self.disentangle(wavelet.detach().cpu().numpy(), 'coif1', 1)
-            kv = torch.cat([torch.Tensor(xl).to(skip.device), torch.Tensor(xh).to(skip.device)], dim=1)
-            attn = self.attns[i](wavelet, kv, kv, dim=1)
-            current_inputs -= attn
             for t in range(0, seq_length, self.kernel):
                 inp_x = current_inputs[:, t:t + self.kernel]  # b,kernel.n,d
                 inp_h = torch.cat(inner_states, dim=1)  # b,t+1,kernel,n,d
@@ -287,7 +231,7 @@ class MSTARNN(nn.Module):
             current_inputs = torch.cat(inner_states[1:], dim=1)  # [B, T, N, D]
 
             current_inputs = self.dropouts[i](current_inputs[:, -self.kernel:, :, :])
-            outputs.append(self.predictors[i](current_inputs) + attn)
+            outputs.append(self.predictors[i](current_inputs))
             if i < self.num_layers - 1:
                 current_inputs = skip - outputs[i]
 
@@ -298,16 +242,6 @@ class MSTARNN(nn.Module):
 
     def init_hidden(self, batch_size):
         return self.grus[0].init_hidden_state(batch_size)
-
-    def disentangle(self, x, w, j):
-        x = x.transpose(0, 3, 2, 1)  # [S,D,N,T]
-        coef = pywt.wavedec(x, w, level=j)
-        coefl = coef[:1]
-        coefh = coef[1:]
-        xl = pywt.waverec(coefl, w).transpose(0, 3, 2, 1)
-        xh = pywt.waverec(coefh, w).transpose(0, 3, 2, 1)
-
-        return xl, xh
 
 
 class MSTACell(nn.Module):
@@ -419,7 +353,7 @@ class Network(nn.Module):
                                args.num_layers, args.embed_dim,
                                in_steps=args.in_steps, out_steps=args.out_steps, kernel=args.kernel,
                                periods=args.periods, weekend=args.weekend,
-                               periods_embedding_dim=args.periods_embedding_dim,dim_feed_forward=args.dim_feed_forward,
+                               periods_embedding_dim=args.periods_embedding_dim,
                                weekend_embedding_dim=args.weekend_embedding_dim, num_input_dim=args.num_input_dim)
 
     def forward(self, x):
@@ -466,7 +400,6 @@ if __name__ == "__main__":
     args.add_argument('--periods', default=config['model']['periods'], type=int)
     args.add_argument('--weekend', default=config['model']['weekend'], type=int)
     args.add_argument('--kernel', default=config['model']['kernel'], type=int)
-    args.add_argument('--dim_feed_forward', default=config['model']['dim_feed_forward'], type=int)
     # train
     args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
     args.add_argument('--random', default=config['train']['random'], type=eval)

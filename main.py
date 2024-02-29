@@ -87,7 +87,6 @@ args.add_argument('--num_layers', default=config['model']['num_layers'], type=in
 args.add_argument('--periods', default=config['model']['periods'], type=int)
 args.add_argument('--weekend', default=config['model']['weekend'], type=int)
 args.add_argument('--kernel', default=config['model']['kernel'], type=int)
-args.add_argument('--dim_feed_forward', default=config['model']['dim_feed_forward'], type=int)
 
 #train
 args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
